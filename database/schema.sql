@@ -13,6 +13,7 @@ CREATE TABLE users (
     username            VARCHAR(60) UNIQUE,
     email               VARCHAR(255) NOT NULL UNIQUE,
     full_name           VARCHAR(120) NOT NULL,
+    phone               VARCHAR(32),
     password_hash       TEXT NOT NULL,
     role                VARCHAR(20) NOT NULL DEFAULT 'USER' CHECK (role IN ('USER', 'ADMIN')),
     referral_code       VARCHAR(24) NOT NULL UNIQUE,           -- e.g. BBREF1001
