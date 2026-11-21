@@ -22,6 +22,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const multer = require('multer');
+const fs = require('fs');
 const path = require('path');
 const { Pool } = require('pg');
 
@@ -54,7 +55,7 @@ const REFERRAL_LEVEL_SPLITS = [
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({ origin: process.env.CORS_ORIGIN || '*', credentials: true }));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '12mb' }));
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -714,6 +715,86 @@ app.post('/api/admin/gateways', requireAdmin, upload.single('qrCode'), async (re
   res.status(201).json(result.rows[0]);
 });
 
+
+
+// ---------------------------------------------------------------------------
+// 9. REAL-TIME SHARED STATE SYNC (Connects User Site <-> Partners Log <-> Supabase DB)
+// ---------------------------------------------------------------------------
+const DATA_DIR = path.join(__dirname, 'data');
+const STATE_FILE = path.join(DATA_DIR, 'state.json');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+let dbStateReady = false;
+async function ensureStateTable() {
+  if (!process.env.DATABASE_URL || dbStateReady) return;
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS botbulls_live_state (
+        id INTEGER PRIMARY KEY,
+        payload JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    dbStateReady = true;
+    console.log('Connected to PostgreSQL live state table.');
+  } catch (err) {
+    console.warn('PostgreSQL state table unavailable, using local JSON fallback:', err.message);
+  }
+}
+
+async function loadSharedState() {
+  await ensureStateTable();
+  if (dbStateReady) {
+    try {
+      const r = await pool.query('SELECT payload FROM botbulls_live_state WHERE id = 1');
+      if (r.rows.length > 0 && r.rows[0].payload) return r.rows[0].payload;
+    } catch {}
+  }
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    }
+  } catch {}
+  return null;
+}
+
+async function saveSharedState(payload) {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(payload));
+  } catch {}
+  await ensureStateTable();
+  if (dbStateReady) {
+    try {
+      await pool.query(
+        `INSERT INTO botbulls_live_state (id, payload, updated_at)
+         VALUES (1, $1::jsonb, NOW())
+         ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`,
+        [JSON.stringify(payload)]
+      );
+      return 'postgres';
+    } catch {}
+  }
+  return 'file';
+}
+
+app.get('/api/health', async (_req, res) => {
+  await ensureStateTable();
+  res.json({ ok: true, storage: dbStateReady ? 'postgresql' : 'local_json' });
+});
+
+app.get('/api/state', async (_req, res) => {
+  const data = await loadSharedState();
+  res.json({ ok: true, storage: dbStateReady ? 'postgresql' : 'local_json', state: data });
+});
+
+app.post('/api/state/sync', async (req, res) => {
+  const payload = req.body && req.body.state;
+  if (!payload || !Array.isArray(payload.users)) {
+    return res.status(400).json({ error: 'Invalid state payload.' });
+  }
+  const storage = await saveSharedState(payload);
+  res.json({ ok: true, storage, updatedAt: new Date().toISOString() });
+});
 
 // Serve uploaded proofs and the BotBulls frontend (public_html/index.html)
 app.use('/uploads', express.static(path.join(__dirname, process.env.UPLOAD_DIR || 'uploads')));
